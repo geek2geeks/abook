@@ -1,3 +1,7 @@
+# Version control and CI metadata are not needed in the image build context
+.git/
+.github/
+
 # Build outputs
 **/bin/
 **/obj/
