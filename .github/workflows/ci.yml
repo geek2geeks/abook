@@ -1,0 +1,116 @@
+# CI for ABook — every job runs on the Owner's self-hosted Windows 11 runner.
+# This is a PUBLIC repository: only `push` to main and `workflow_dispatch` are
+# allowed, so no fork or pull-request code is ever executed on the local machine.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_NOLOGO: 'true'
+  DOTNET_CLI_TELEMETRY_OPTOUT: 'true'
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  dotnet:
+    name: .NET build and test
+    runs-on: [self-hosted, Windows, X64, abook]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup .NET 10 SDK
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      # setup-dotnet's own `cache: true` requires a packages.lock.json, which
+      # this repository does not have, so the NuGet global-packages folder is
+      # cached explicitly instead.
+      - name: Cache NuGet packages
+        uses: actions/cache@v6
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-
+
+      - name: Restore solution
+        run: dotnet restore ABook.slnx
+
+      - name: Build solution (Release)
+        run: dotnet build ABook.slnx --configuration Release --no-restore
+
+      # ABook.Tests is not part of ABook.slnx, so the test project is restored
+      # and run explicitly (see CICD-AUDIT.md, finding F10).
+      - name: Restore test project
+        run: dotnet restore src/ABook.Tests/ABook.Tests.csproj
+
+      - name: Test
+        run: dotnet test src/ABook.Tests/ABook.Tests.csproj --configuration Release --no-restore
+
+  ui:
+    name: UI lint and production build
+    runs-on: [self-hosted, Windows, X64, abook]
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Node 24 LTS satisfies the Vite 8 engine range (^20.19.0 || >=22.12.0).
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: src/abook-ui/package-lock.json
+
+      - name: Install dependencies (npm ci)
+        working-directory: src/abook-ui
+        run: npm ci
+
+      - name: Lint
+        working-directory: src/abook-ui
+        run: npm run lint
+
+      # `npm run build` is `tsc -b && vite build`; Vite writes to
+      # src/ABook.Api/wwwroot (vite.config.ts:54).
+      - name: Typecheck and production build
+        working-directory: src/abook-ui
+        run: npm run build
+
+      - name: Upload UI build
+        uses: actions/upload-artifact@v7
+        with:
+          name: abook-ui-wwwroot
+          path: src/ABook.Api/wwwroot
+          if-no-files-found: error
+          retention-days: 7
+
+  docker:
+    name: Docker image build
+    needs: [dotnet, ui]
+    runs-on: [self-hosted, Windows, X64, abook]
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Build image (no push)
+        run: docker build --tag abook:ci --file Dockerfile .
+
+      - name: Report image id
+        run: docker image inspect abook:ci --format '{{.Id}}'
